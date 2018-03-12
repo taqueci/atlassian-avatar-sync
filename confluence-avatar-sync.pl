@@ -292,7 +292,7 @@ sub _get_avatar {
 	my $r = $ua->request($req);
 
 	unless ($r->is_success) {
-		d_error("Failed to download avatar picture from $url");
+		p_error("Failed to download avatar picture from $url");
 		p_log($r->status_line);
 		return undef;
 	}
