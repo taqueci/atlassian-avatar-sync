@@ -1,10 +1,10 @@
-# Confluence Avatar Sync
+# Atlassian Avatar Sync
 
 This script copies avatar pictures from JIRA to Confluence.
 
 ## Usage
 
-    perl confluence-avatar-sync.pl https://example.com/conluence https://example.com/jira
+    perl atlassian-avatar-sync.pl https://example.com/conluence https://example.com/jira
 
 ## License
 

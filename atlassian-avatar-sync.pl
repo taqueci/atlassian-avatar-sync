@@ -1,10 +1,10 @@
 =head1 NAME
 
-confluence-avatar-sync.pl - copies avatar pictures from JIRA to Confluence
+atlassian-avatar-sync.pl - copies avatar pictures from JIRA to Confluence
 
 =head1 SYSNOPSIS
 
-    perl confluence-avatar-sync.pl [OPTION] ... URL_CONFLUENCE URL_JIRA [TARGET_USER] ...
+    perl atlassian-avatar-sync.pl [OPTION] ... URL_CONFLUENCE URL_JIRA [TARGET_USER] ...
 
 =head1 DESCRIPTION
 
