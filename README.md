@@ -1,6 +1,6 @@
 # Atlassian Avatar Sync
 
-This script copies avatar pictures from JIRA to Confluence.
+This script copies avatar pictures from JIRA to Confluence or Bitbucket.
 
 ## Usage
 

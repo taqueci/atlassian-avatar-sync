@@ -1,15 +1,17 @@
 =head1 NAME
 
-atlassian-avatar-sync.pl - copies avatar pictures from JIRA to Confluence
+atlassian-avatar-sync.pl - copies avatar pictures from JIRA to Confluence or
+Bitbucket
 
 =head1 SYSNOPSIS
 
     perl atlassian-avatar-sync.pl [OPTION] ... URL_CONFLUENCE URL_JIRA [TARGET_USER] ...
+    perl atlassian-avatar-sync.pl --bitbucket [OPTION] ... URL_BITBUCKET URL_JIRA [TARGET_USER] ...
 
 =head1 DESCRIPTION
 
 This script copies avatar pictures of user TARGET_USER from URL_JRIA to
-URL_CONFLUENCE.
+URL_CONFLUENCE or URL_BITBUCKET.
 
 If TARGET_USER is not specified, all avatar pictures are copied.
 
@@ -19,11 +21,11 @@ If TARGET_USER is not specified, all avatar pictures are copied.
 
 =item -u USER, --user=UESR
 
-Use USER for authentication of Confluence.
+Use USER for authentication of Confluence or Bitbucket.
 
 =item -p PASSWORD, --passowrd=PASSWORD
 
-Use PASSWORD for authentication of Confluence.
+Use PASSWORD for authentication of Confluence or Bitbucket.
 
 =item -U USER, --jira-user=UESR
 
@@ -67,21 +69,13 @@ use warnings;
 use utf8;
 
 use Digest::MD5 qw(md5_hex);
-use File::Basename;
 use Getopt::Long qw(:config no_ignore_case no_auto_abbrev gnu_compat);
 use HTTP::Request;
-use JSON;
 use LWP::UserAgent;
 use Pod::Usage;
 use Term::ReadKey;
 
-my $DEFAULT_AVATAR_ID = 10122;
-my $DEFAULT_AVATAR_FILE = 'default.png';
-
-my $p_message_prefix = "";
-my $p_log_file;
-my $p_is_verbose = 0;
-my $p_encoding = 'utf-8';
+PLib::import();
 
 _main(@ARGV) or exit 1;
 
@@ -92,7 +86,7 @@ sub _main {
 	local @ARGV = @_;
 
 	my %opt;
-	GetOptions(\%opt, 'force|f', 'user|u=s', 'password|p=s',
+	GetOptions(\%opt, '--bitbucket|b', 'force|f', 'user|u=s', 'password|p=s',
 			   'jira-user|U=s', 'jira-password|P=s',
 			   'log|l=s', 'verbose', 'help') or return 0;
 
@@ -108,7 +102,9 @@ sub _main {
 
 	my ($url_to, $url_from, @target) = @ARGV;
 
-	print "Authentication for Confluence $url_to\n" unless $opt{user} &&
+	my $to = $opt{bitbucket} ? 'Bitbucket' : 'Confluence';
+
+	print "Authentication for $to $url_to\n" unless $opt{user} &&
 		$opt{password};
 	my $user = $opt{user} // _read_key("User: ");
 	my $passwd = $opt{password} // _read_key("Password: ", 1);
@@ -118,17 +114,20 @@ sub _main {
 	my $user_from = $opt{'jira-user'} // _read_key("User: ");
 	my $passwd_from = $opt{'jira-password'} // _read_key("Password: ", 1);
 
+	my $appl_from = Jira->new($url_from, $user_from, $passwd_from);
+
+	my $appl_to = $opt{bitbucket} ?
+		Bitbucket->new($url_to, $user, $passwd) :
+		Confluence->new($url_to, $user, $passwd);
+
 	unless (@target > 0) {
 		p_verbose("Reading user information from $url_to");
-		my $users = _all_users($url_to, $user, $passwd) or return 0;
-
+		my $users = $appl_to->all_users or return 0;
 		@target = @$users;
 	}
 
 	p_verbose("Synchronizing avatars");
-	_sync_avatars(\@target, $url_to, $user, $passwd,
-				  $url_from, $user_from, $passwd_from,
-				  $opt{force}) or return 0;
+	_sync_avatars(\@target, $appl_to, $appl_from, $opt{force}) or return 0;
 
 	p_verbose("Completed!\n");
 
@@ -150,20 +149,107 @@ sub _read_key {
 	return $val;
 }
 
-sub _all_users {
-	my ($url, $user, $passwd) = @_;
+sub _sync_avatars {
+	my ($target, $appl_to, $appl_from, $force) = @_;
+	my $name_to = ref $appl_to;
+	my $nerr = 0;
+
+	foreach my $x (@$target) {
+		p_verbose("Synchronizing avatar picture of user '$x'");
+
+		p_verbose("Getting avatar from JIRA");
+		my $avtr_from = $appl_from->avatar($x);
+
+		unless ($avtr_from) {
+			$nerr++;
+			next;
+		}
+
+		if ($avtr_from->is_default) {
+			p_warning("Avatar for user '$x' is not updated because no new one has been uploaded");
+			next;
+		}
+
+		my $t = $avtr_from->type;
+
+		unless (($t eq 'image/png') || ($t eq 'image/jpeg') ||
+				($t eq 'image/gif')) {
+			p_warning("Avatar for user '$x' is not updated because image type '$t' is not supported");
+			next;
+		}
+
+		p_verbose("Getting existing avatar from $name_to");
+		my $avtr_to = $appl_to->avatar($x);
+
+		unless ($avtr_to) {
+			$nerr++;
+			next;
+		}
+
+		if ($avtr_from->is_equal($avtr_to) ||
+			(!$force && !$avtr_to->is_default)) {
+			p_warning("Avatar for user '$x' has already been updated");
+			next;
+		}
+
+		p_verbose("Setting avatar of $name_to");
+		$avtr_to->set_data($avtr_from->type, $avtr_from->data,
+						   $avtr_from->path);
+
+		$avtr_to->push or $nerr++;
+	}
+
+	return $nerr == 0;
+}
+
+# JIRA
+package Jira;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd) = @_;
+	my $self = {url => $url, user => $user, password => $passwd};
+
+	return bless $self, $class;
+}
+
+sub avatar {
+	my ($self, $id) = @_;
+
+	my $avatar = Avatar::Jira->new($self->{url}, $self->{user},
+								   $self->{password}, $id);
+
+	return $avatar->pull ? $avatar : undef;
+}
+
+# Confluence
+package Confluence;
+
+use JSON;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd) = @_;
+	my $self = {url => $url, user => $user, password => $passwd};
+
+	return bless $self, $class;
+}
+
+sub all_users {
+	my $self = shift;
+	my $url = $self->{url};
 
 	my $u = "$url/rpc/json-rpc/confluenceservice-v2/getActiveUsers";
 	my $req = HTTP::Request->new(POST => $u);
 
-	$req->authorization_basic($user, $passwd);
+	$req->authorization_basic($self->{user}, $self->{password});
 	$req->content_type('application/json');
 	$req->content(encode_json([JSON::true]));
 
 	my $ua = LWP::UserAgent->new;
 	my $r = $ua->request($req);
-
-	p_log($r->content);
 
 	unless ($r->is_success) {
 		p_error("Failed to get all users from $url");
@@ -182,144 +268,246 @@ sub _all_users {
 	return $c;
 }
 
-sub _sync_avatars {
-	my ($target, $url_to, $user_to, $passwd_to,
-		$url_from, $user_from, $passwd_from, $force) = @_;
-	my $nerr = 0;
+sub avatar {
+	my ($self, $id) = @_;
 
-	foreach my $x (@$target) {
-		p_verbose("Synchronizing avatar picture of user '$x'");
+	my $avatar = Avatar::Confluence->new($self->{url}, $self->{user},
+										 $self->{password}, $id);
 
-		p_verbose("Getting URL of avatar picture from JIRA");
-		my $avatar = _avatar_url($url_from, $user_from, $passwd_from, $x);
-
-		unless ($avatar) {
-			$nerr++;
-			next;
-		}
-
-		if ($avatar =~ /avatarId=$DEFAULT_AVATAR_ID/) {
-			p_warning("Avatar for user '$x' is not updated because no new one has been uploaded");
-			next;
-		}
-
-		p_verbose("Checking existing avatar in Confluence");
-		my $fn = _avatar_file_name($avatar);
-		my $efn = _existing_file_name($url_to, $user_to, $passwd_to, $x);
-
-		unless ($efn) {
-			$nerr++;
-			next;
-		}
-
-		if (($efn eq $fn) || ((!$force) && ($efn ne $DEFAULT_AVATAR_FILE))) {
-			p_warning("Avatar for user '$x' has already been updated");
-			next;
-		}
-
-		p_verbose("Downloading avatar picture from $avatar");
-		my $data = _get_avatar($avatar, $user_from, $passwd_from);
-
-		unless ($data) {
-			$nerr++;
-			next;
-		}
-
-		my $t = $data->{type};
-
-		unless (($t eq 'image/png') || ($t eq 'image/jpeg') ||
-				($t eq 'image/gif')) {
-			p_warning("Avatar for user '$x' is not updated because image type '$t' is not supported");
-			next;
-		}
-
-		p_verbose("Setting Confluence avatar");
-		_set_avatar($url_to, $user_to, $passwd_to, $x, $fn, $t,
-					$data->{content}) or $nerr++;
-	}
-
-	return $nerr == 0;
+	return $avatar->pull ? $avatar : undef;
 }
 
-sub _avatar_url {
-	my ($url, $user, $passwd, $target) = @_;
+# Bitbucket
+package Bitbucket;
 
-	my $u = "$url/rest/api/2/user?username=$target";
+use JSON;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd) = @_;
+	my $self = {url => $url, user => $user, password => $passwd};
+
+	return bless $self, $class;
+}
+
+sub all_users {
+	my $self = shift;
+	my $url = $self->{url};
+
+	my $start = 0;
+	my @users;
+
+	my $ua = LWP::UserAgent->new;
+
+	while (1) {
+		my $u = "$url/rest/api/1.0/users?start=$start";
+		my $req = HTTP::Request->new(GET => $u);
+
+		$req->authorization_basic($self->{user}, $self->{password});
+		$req->content_type('application/json');
+
+		my $r = $ua->request($req);
+
+		unless ($r->is_success) {
+			p_error("Failed to get all users from $url");
+			p_log($r->status_line);
+			return undef;
+		}
+
+		my $c = decode_json($r->content);
+
+		push @users, map {$_->{name}} @{$c->{values}};
+
+		last if $c->{isLastPage};
+
+		$start = $c->{nextPageStart};
+	}
+
+	return \@users;
+}
+
+sub avatar {
+	my ($self, $id) = @_;
+
+	my $avatar = Avatar::Bitbucket->new($self->{url}, $self->{user},
+										$self->{password}, $id);
+
+	return $avatar->pull ? $avatar : undef;
+}
+
+# JIRA avatar
+package Avatar::Jira;
+
+use Digest::MD5 qw(md5_hex);
+use File::Basename;
+use JSON;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd, $id) = @_;
+	my $self = {url => $url, user => $user, password => $passwd, id => $id};
+
+	return bless $self, $class;
+}
+
+sub pull {
+	my $self = shift;
+
+	my $path = $self->_path($self->{id}) or return 0;
+
+	return $self->_get($path);
+}
+
+sub _path {
+	my ($self, $id) = @_;
+	my $url = $self->{url};
+
+	my $u = "$url/rest/api/2/user?username=$id";
 	my $req = HTTP::Request->new(GET => $u);
 
-	$req->authorization_basic($user, $passwd);
+	$req->authorization_basic($self->{user}, $self->{password});
 
 	my $ua = LWP::UserAgent->new;
 	my $r = $ua->request($req);
 
 	unless ($r->is_success) {
-		p_error("Failed to get avatar URL for user '$target'");
+		p_error("Failed to get avatar URL for user '$id'");
 		p_log($r->status_line);
-		return 0;
+		return undef;
 	}
 	
 	return decode_json($r->content)->{avatarUrls}->{'48x48'};
 }
 
-sub _existing_file_name {
-	my ($url, $user, $passwd, $target) = @_;
+sub _get {
+	my ($self, $path) = @_;
 
-	my $u = "$url/rest/api/user?username=$target";
-	my $req = HTTP::Request->new(GET => $u);
+	my $req = HTTP::Request->new(GET => $path);
 
-	$req->authorization_basic($user, $passwd);
+	$req->authorization_basic($self->{user}, $self->{password});
 
 	my $ua = LWP::UserAgent->new;
 	my $r = $ua->request($req);
 
 	unless ($r->is_success) {
-		p_error("Failed to get information of user '$target'");
+		p_error("Failed to download avatar picture from $path");
+		p_log($r->status_line);
+		return 0;
+	}
+
+	my $t = $r->content_type;
+	my $c = $r->content;
+
+	$self->{type} = $t;
+	$self->{data} = $c;
+	$self->{path} = $path;
+
+	return 1;
+}
+
+sub type {
+	return shift->{type};
+}
+
+sub data {
+	return shift->{data};
+}
+
+sub path {
+	return shift->{path};
+}
+
+sub is_default {
+	my $DEFAULT_AVATAR_ID = 10122;
+
+	return shift->{path} =~ /avatarId=$DEFAULT_AVATAR_ID/;
+}
+
+sub is_equal {
+	my ($self, $avatar) = @_;
+
+	my $t = ref $avatar;
+
+	if ($t eq 'Avatar::Confluence') {
+		return md5_hex($self->{path}) eq basename($avatar->path);
+	} elsif ($t eq 'Avatar::Bitbucket') {
+		return md5_hex($self->{data}) eq md5_hex($avatar->data);
+	} else {
+		return 0;
+	}
+}
+
+# Confluence avatar
+package Avatar::Confluence;
+
+use Digest::MD5 qw(md5_hex);
+use File::Basename;
+use JSON;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd, $id) = @_;
+	my $self = {url => $url, user => $user, password => $passwd, id => $id};
+
+	return bless $self, $class;
+}
+
+sub pull {
+	my $self = shift;
+
+	my $id = $self->{id};
+	my $url = $self->{url};
+
+	my $u = "$url/rest/api/user?username=$id";
+	my $req = HTTP::Request->new(GET => $u);
+
+	$req->authorization_basic($self->{user}, $self->{password});
+
+	my $ua = LWP::UserAgent->new;
+	my $r = $ua->request($req);
+
+	unless ($r->is_success) {
+		p_error("Failed to get information of user '$id'");
 		p_log($r->status_line);
 		return 0;
 	}
 	
-	return basename decode_json($r->content)->{profilePicture}->{path};
-}
-
-sub _get_avatar {
-	my ($url, $user, $passwd) = @_;
-
-	my $req = HTTP::Request->new(GET => $url);
-
-	$req->authorization_basic($user, $passwd);
-
-	my $ua = LWP::UserAgent->new;
-	my $r = $ua->request($req);
-
-	unless ($r->is_success) {
-		p_error("Failed to download avatar picture from $url");
-		p_log($r->status_line);
-		return undef;
-	}
-
-	my $m = $r->content_type;
+	my $t = $r->content_type;
 	my $c = $r->content;
 
-	return {type => $m, content => $c};
+	$self->{type} = $t;
+	$self->{data} = $c;
+	$self->{path} = decode_json($r->content)->{profilePicture}->{path};
+
+	return 1;
 }
 
-sub _set_avatar {
-	my ($url, $user, $passwd, $target, $name, $type, $data) = @_;
+sub push {
+	my $self = shift;
+
+	my $url = $self->{url};
+	my $id = $self->{id};
 
 	my $u = "$url/rpc/json-rpc/confluenceservice-v2/addProfilePicture";
 	my $req = HTTP::Request->new(POST => $u);
 
-	my @d = unpack 'C*', $data;
+	my $name = defined($self->{path}) ?
+		basename($self->{path}) : md5_hex($self->{origin});
 
-	$req->authorization_basic($user, $passwd);
+	my @d = unpack 'C*', $self->{data};
+
+	$req->authorization_basic($self->{user}, $self->{password});
 	$req->content_type('application/json');
-	$req->content(encode_json([$target, $name, $type, \@d]));
+	$req->content(encode_json([$id, $name, $self->{type}, \@d]));
 
 	my $ua = LWP::UserAgent->new;
 	my $r = $ua->request($req);
 
 	unless ($r->is_success) {
-		p_error("Failed to update avatar of user '$target'");
+		p_error("Failed to update avatar of user '$id'");
 		p_log($r->status_line);
 		return 0;
 	}
@@ -327,12 +515,152 @@ sub _set_avatar {
 	return 1;
 }
 
-sub _avatar_file_name {
-	return md5_hex shift;
+sub data {
+	return shift->{data};
 }
+
+sub set_data {
+	my ($self, $type, $data, $origin) = @_;
+
+	$self->{type} = $type;
+	$self->{data} = $data;
+	$self->{path} = undef;
+	$self->{origin} = $origin;
+}
+
+sub path {
+	return shift->{path};
+}
+
+sub is_default {
+	my $path = shift->{path};
+	my $DEFAULT_AVATAR_FILE = 'default.png';
+
+	return defined($path) ? (basename($path) eq $DEFAULT_AVATAR_FILE) : 0;
+}
+
+# Bitbucket avatar
+package Avatar::Bitbucket;
+
+use Digest::MD5 qw(md5_hex);
+use HTTP::Request::Common;
+use JSON;
+
+INIT { PLib::import() }
+
+sub new {
+	my ($class, $url, $user, $passwd, $id) = @_;
+	my $self = {url => $url, user => $user, password => $passwd, id => $id};
+
+	return bless $self, $class;
+}
+
+sub pull {
+	my $self = shift;
+
+	my $id = $self->{id};
+	my $url = $self->{url};
+
+	my $u = "$url/users/$id/avatar.png";
+	my $req = HTTP::Request->new(GET => $u);
+
+	$req->authorization_basic($self->{user}, $self->{password});
+
+	my $ua = LWP::UserAgent->new;
+	my $r = $ua->request($req);
+
+	unless ($r->is_success) {
+		p_error("Failed to download avatar picture from $url");
+		p_log($r->status_line);
+		return 0;
+	}
+
+	my $t = $r->content_type;
+	my $c = $r->content;
+
+	$self->{type} = $t;
+	$self->{data} = $c;
+
+	return 1;
+}
+
+sub push {
+	my $self = shift;
+
+	my $url = $self->{url};
+	my $id = $self->{id};
+
+	my $u = "$url/rest/api/1.0/users/$id/avatar.png";
+	my $req = POST $u, Content_Type => 'multipart/form-data',
+		Content => [avatar => $self->{data}];
+
+	$req->authorization_basic($self->{user}, $self->{password});
+	$req->header('X-Atlassian-Token' => 'no-check');
+
+	my $ua = LWP::UserAgent->new;
+	my $r = $ua->request($req);
+
+	unless ($r->is_success) {
+		p_error("Failed to update avatar of user '$id'");
+		p_log($r->status_line);
+		return 0;
+	}
+
+	return 1;
+}
+
+sub data {
+	return shift->{data};
+}
+
+sub set_data {
+	my ($self, $type, $data, $origin) = @_;
+
+	$self->{type} = $type;
+	$self->{data} = $data;
+	$self->{path} = undef;
+	$self->{origin} = $origin;
+}
+
+sub path {
+	return undef;
+}
+
+sub is_default {
+	my $DEFAULT_AVATAR_MD5 = 'b1c94647deb67e378c7d72e6a467c2b5';
+
+	return md5_hex(shift->{data}) eq $DEFAULT_AVATAR_MD5;
+}
+
+# Library
+package PLib;
 
 use Carp;
 use Encode;
+
+my $p_message_prefix;
+my $p_log_file;
+my $p_is_verbose;
+my $p_encoding;
+
+INIT {
+	$p_message_prefix = "";
+	$p_is_verbose = 0;
+	$p_encoding = 'utf-8';
+}
+
+sub import {
+	my @EXPORT = qw(p_message p_warning p_error p_verbose p_log
+					p_set_encoding p_set_message_prefix p_set_log
+					p_set_verbose p_exit p_error_exit p_slurp);
+
+	my $caller = caller;
+
+	no strict 'refs';
+	foreach my $func (@EXPORT) {
+		*{"${caller}::$func"} = \&{"PLib::$func"};
+	}
+}
 
 sub p_decode {
 	return decode($p_encoding, shift);
